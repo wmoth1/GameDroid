@@ -1,0 +1,72 @@
+name: Build APK from zip
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # only used to attach the APK to a release on v* tags
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history, so the newest zip can be told apart from old ones
+
+      # Unzips the .zip in the repo root. If there are several, the most recently committed one wins.
+      # If the project files are already in the repo, the zip step is skipped.
+      - name: Unzip project
+        run: |
+          if [ -f settings.gradle.kts ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+          else
+            zip=""; best=0
+            for f in ./*.zip; do
+              [ -e "$f" ] || continue
+              t=$(git log -1 --format=%ct -- "$f")
+              echo "Found $f (committed at $t)"
+              if [ "${t:-0}" -ge "$best" ]; then best=${t:-0}; zip="$f"; fi
+            done
+            if [ -z "$zip" ]; then echo "No .zip found in the repo root"; exit 1; fi
+            echo "::notice::Building from $zip"
+            mkdir -p _proj
+            unzip -q "$zip" -d _proj
+            found=$(find _proj -name settings.gradle.kts | head -n1)
+            if [ -z "$found" ]; then echo "settings.gradle.kts not found inside the zip"; exit 1; fi
+            echo "PROJECT_DIR=$(dirname "$found")" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # No Gradle wrapper in the project, so install Gradle directly (AGP 8.5 needs 8.7+).
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DroidController-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Attach APK to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
